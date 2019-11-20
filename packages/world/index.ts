@@ -2,6 +2,52 @@ import { System, FileSystem } from "@xmcl/common";
 import ByteBuffer from "bytebuffer";
 import { NBT } from "@xmcl/nbt";
 
+function createBitVector(arr: Long[], length: number, bitLen: number): ArrayLike<number> {
+    const maxEntryValue = (1 << bitLen) - 1;
+    return new Proxy({
+        length,
+    }, {
+        get(target, name) {
+            if (name === "length") {
+                return length;
+            }
+            const index = Number.parseInt(name as string, 10);
+            if (index < 0 || index > length) { throw new Error(`Expect index in 0 to ${length}. Got ${index}.`); }
+            let offset = index * bitLen;
+            let j = offset >> 6;
+            let k = ((index + 1) * bitLen - 1) >> 6;
+            let l = offset ^ j << 6;
+
+            if (j == k) {
+                return arr[j].shiftRightUnsigned(l).and(maxEntryValue).getLowBits();
+            } else {
+                let shiftLeft = 64 - l;
+                const v = arr[j].shiftRightUnsigned(l).or(arr[k].shiftLeft(shiftLeft));
+                return v.and(maxEntryValue).low;
+            }
+        }
+    });
+}
+
+const MULTIPLY_DE_BRUIJN_BIT_POSITION = [0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8, 31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9];
+
+function log2DeBruijn(value: number) {
+    function isPowerOfTwo(v: number) {
+        return v !== 0 && (v & v - 1) === 0;
+    }
+    function smallestEncompassingPowerOfTwo(value: number) {
+        let i = value - 1;
+        i = i | i >> 1;
+        i = i | i >> 2;
+        i = i | i >> 4;
+        i = i | i >> 8;
+        i = i | i >> 16;
+        return i + 1;
+    }
+    value = isPowerOfTwo(value) ? value : smallestEncompassingPowerOfTwo(value);
+    return MULTIPLY_DE_BRUIJN_BIT_POSITION[Long.fromInt(value).multiply(125613361).shiftRight(27).and(31).low];
+}
+
 export class WorldReader {
     static async create(path: string | Uint8Array) {
         return new WorldReader(await System.openFileSystem(path));
@@ -135,9 +181,30 @@ export namespace RegionReader {
             seekFunc = (i) => seekLegacy(blocks, data, add, i);
         } else {
             const blockStates = section.BlockStates;
-            const bitLen = blockStates.length * 64 / 4096;
-            const bitMask = mask(bitLen);
-            seekFunc = (i) => seek(blockStates, bitLen, bitMask, i);
+            const avgBitLen = blockStates.length * 64 / 4096;
+            // const bitMask = mask(bitLen);
+            let bitLen: number;
+            let largeScale: boolean = false;
+            const actualBitLen = log2DeBruijn(section.Palette.length);
+            if (actualBitLen <= 4) {
+                bitLen = 4;
+            } else if (actualBitLen < 9) {
+                bitLen = actualBitLen;
+            } else {
+                bitLen = actualBitLen;
+                largeScale = true;
+            }
+            if (largeScale) {
+                const vec = createBitVector(blockStates, 4096, actualBitLen);
+                seekFunc = (i) => vec[i];
+            } else if (avgBitLen === bitLen) {
+                const vec = createBitVector(blockStates, 4096, bitLen);
+                seekFunc = (i) => vec[i];
+            } else {
+                const vec = createBitVector(blockStates, 4096, avgBitLen);
+                seekFunc = (i) => vec[i];
+            }
+            // seekFunc = (i) => seek(blockStates, bitLen, bitMask, i);
         }
         for (let i = 0; i < 4096; ++i) {
             const x = i & 15;
